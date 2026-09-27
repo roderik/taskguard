@@ -82,8 +82,16 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   fit yet. This is safe: a job only reaches taskguard when its launcher has
   decided that it may run. Turbo starts a task only after the tasks it depends
   on are done, and `a && b` starts `b` only after `a` ends.
-- **No starvation.** A job that newer jobs have passed for 2 minutes gets a
-  reservation. Nothing newer starts until it has started.
+- **No starvation.** A job that newer jobs have passed for 2 minutes
+  (`max_bypass`) gets a reservation. Nothing newer starts until it has started.
+- **Backfill, if you ask for it.** A reservation for a job that does not fit
+  holds room it cannot use: a 29 GB compile that waits for memory keeps a
+  0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
+  its turn only while it could start: until it has waited `max_backfill`
+  seconds, newer jobs that fit start while it cannot, and nothing newer starts
+  once it fits. After `max_backfill` the reservation holds anyway, so a steady
+  stream of small jobs cannot keep it out. Off by default (`0`); `1800` lets
+  small jobs through for half an hour.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. `taskguard --id e2e -j1 ...`. CPU and memory
   are always shared by the whole machine.
@@ -414,6 +422,12 @@ the others write:
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each
 other's jobs. They still see the load of those jobs in the machine readings.
+
+Settings files are read strictly: a version that does not know a setting
+rejects the file. The user config and a repo's `.taskguard.toml` are read by
+every version that runs there, so set a new setting such as `max_backfill`
+in them only once every such version knows it. The dashboard's Config view
+does not offer `max_backfill` for that reason.
 
 ## Uninstall
 

@@ -27,6 +27,8 @@ struct Job {
     need_kb: u64,
     need_cpu: f64,
     est_dur: Option<f64>,
+    /// When it joins the queue.
+    arrive: f64,
 }
 
 struct Scenario {
@@ -48,6 +50,8 @@ struct Outcome {
     /// Seconds until the last job ended.
     finished_at: f64,
     all_ran: bool,
+    /// When each job started, by its place in the scenario.
+    started: Vec<Option<f64>>,
 }
 
 /// The kernel's pressure level as a function of memory in use, like macOS:
@@ -64,7 +68,7 @@ fn pressure(pct: f64) -> f64 {
 }
 
 fn run(s: &Scenario, lim: &Limits) -> Outcome {
-    let mut waiting: Vec<Entry> = s
+    let mut arriving: Vec<Entry> = s
         .jobs
         .iter()
         .enumerate()
@@ -75,15 +79,21 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
             need_cpu: j.need_cpu,
             known: j.known,
             est_dur_s: j.est_dur,
+            queued_at: j.arrive,
             ..Default::default()
         })
         .collect();
+    let mut waiting: Vec<Entry> = Vec::new();
     let mut running: Vec<(Entry, f64, Job)> = Vec::new();
     let mut starts: Vec<f64> = Vec::new();
     let mut recent: Vec<(f64, u64, u64)> = Vec::new();
-    let mut out = Outcome::default();
+    let mut out = Outcome { started: vec![None; s.jobs.len()], ..Default::default() };
     let mut t = 0.0;
-    while t < 3600.0 && (!waiting.is_empty() || !running.is_empty()) {
+    while t < 3600.0 && (!arriving.is_empty() || !waiting.is_empty() || !running.is_empty()) {
+        // Tickets follow arrival, so the queue stays in ticket order.
+        let (now_in, later): (Vec<Entry>, Vec<Entry>) = arriving.into_iter().partition(|e| e.queued_at <= t);
+        waiting.extend(now_in);
+        arriving = later;
         running.retain(|(_, start, j)| {
             let alive = t - start < j.secs;
             if !alive {
@@ -126,6 +136,11 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
                 if !me.known {
                     starts.push(t);
                 }
+                // Every older job that still waits has now been passed.
+                for w in waiting.iter_mut().filter(|w| w.ticket < me.ticket && w.bypassed_since.is_none()) {
+                    w.bypassed_since = Some(t);
+                }
+                out.started[me.ticket as usize - 1] = Some(t);
                 let job = s.jobs[me.ticket as usize - 1].clone();
                 running.push((me, t, job));
                 waiting.remove(i);
@@ -135,21 +150,30 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
         }
         t += TICK;
     }
-    out.all_ran = waiting.is_empty() && running.is_empty();
+    out.all_ran = arriving.is_empty() && waiting.is_empty() && running.is_empty();
     out
 }
 
 fn new_tsc(peak_mb: u64) -> Job {
     // A first run: taskguard reserves its 1.5 GB estimate.
-    Job { peak_kb: peak_mb * 1024, cores: 1.5, secs: 30.0, known: false, need_kb: 1536 * 1024, need_cpu: 1.0, est_dur: None }
+    Job { peak_kb: peak_mb * 1024, cores: 1.5, secs: 30.0, known: false, need_kb: 1536 * 1024, need_cpu: 1.0, est_dur: None, arrive: 0.0 }
 }
 
 fn learned_tsc(peak_mb: u64) -> Job {
-    Job { peak_kb: peak_mb * 1024, cores: 1.5, secs: 30.0, known: true, need_kb: peak_mb * 1024, need_cpu: 1.5, est_dur: Some(30.0) }
+    Job {
+        peak_kb: peak_mb * 1024,
+        cores: 1.5,
+        secs: 30.0,
+        known: true,
+        need_kb: peak_mb * 1024,
+        need_cpu: 1.5,
+        est_dur: Some(30.0),
+        arrive: 0.0,
+    }
 }
 
 fn lint() -> Job {
-    Job { peak_kb: 200 * 1024, cores: 2.0, secs: 0.5, known: true, need_kb: 200 * 1024, need_cpu: 2.0, est_dur: Some(0.5) }
+    Job { peak_kb: 200 * 1024, cores: 2.0, secs: 0.5, known: true, need_kb: 200 * 1024, need_cpu: 2.0, est_dur: Some(0.5), arrive: 0.0 }
 }
 
 fn mixed_first_runs() -> Vec<Job> {
@@ -197,12 +221,57 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// A job with a known need that arrives at `arrive`.
+fn known(mem_gb: u64, cores: f64, secs: f64, arrive: f64) -> Job {
+    Job { peak_kb: mem_gb * GB, cores, secs, known: true, need_kb: mem_gb * GB, need_cpu: cores, est_dur: Some(secs), arrive }
+}
+
+/// A 12 GB job queues behind a 14 GB compile that runs for 10 minutes and
+/// cannot start next to it. Small jobs arrive every 20 s; each fits easily.
+fn head_of_line() -> Scenario {
+    let mut jobs = vec![known(14, 2.0, 600.0, 0.0), known(12, 2.0, 300.0, 1.0)];
+    jobs.extend((0..30).map(|i| known(1, 0.5, 30.0, 2.0 + 20.0 * i as f64)));
+    Scenario {
+        name: "a 12 GB job waits for a compile; small jobs arrive every 20 s",
+        jobs,
+        other_mem: Box::new(|_| 4 * GB),
+        other_cpu: Box::new(|_| 1.0),
+    }
+}
+
+/// Small jobs arrive every 2 s for 25 minutes, enough to keep memory at the
+/// limit on their own. A 12 GB job arrives after a minute and never finds
+/// 12 GB free while they keep coming.
+fn steady_stream() -> Scenario {
+    let mut jobs: Vec<Job> = (0..30).map(|i| known(1, 0.2, 60.0, 2.0 * i as f64)).collect();
+    jobs.push(known(12, 2.0, 60.0, 60.0));
+    jobs.extend((30..750).map(|i| known(1, 0.2, 60.0, 2.0 * i as f64)));
+    Scenario { name: "small jobs every 2 s keep memory full", jobs, other_mem: Box::new(|_| 4 * GB), other_cpu: Box::new(|_| 1.0) }
+}
+
+/// The longest any small job (all but the scenario's large ones) waited.
+fn worst_small_wait(s: &Scenario, o: &Outcome) -> f64 {
+    s.jobs
+        .iter()
+        .zip(&o.started)
+        .filter(|(j, _)| j.peak_kb <= GB)
+        .map(|(j, t)| t.expect("every job started") - j.arrive)
+        .fold(0.0, f64::max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const LIM: Limits =
-        Limits { cpu_max_pct: 100.0, mem_max_pct: 85.0, learn_stagger: 5.0, max_bypass: 120.0, cpu_min_duration: 5.0, pressure_max: 20.0 };
+    const LIM: Limits = Limits {
+        cpu_max_pct: 100.0,
+        mem_max_pct: 85.0,
+        learn_stagger: 5.0,
+        max_bypass: 120.0,
+        max_backfill: 0.0,
+        cpu_min_duration: 5.0,
+        pressure_max: 20.0,
+    };
 
     #[test]
     fn taskguard_holds_back_when_other_programs_load_the_machine() {
@@ -238,5 +307,39 @@ mod tests {
         let o = run(&s, &old);
         eprintln!("old rules, freeze replay: worst memory {:.0}%", o.worst_pct);
         assert!(o.worst_pct > 95.0, "the old rules fill the machine, as in the real freeze (97%): {:.0}%", o.worst_pct);
+    }
+
+    #[test]
+    fn small_jobs_start_while_a_reserved_job_waits_for_memory() {
+        let s = head_of_line();
+        let strict = run(&s, &LIM);
+        let backfill = run(&s, &Limits { max_backfill: 1800.0, ..LIM });
+        let (head_strict, head_backfill) = (strict.started[1].unwrap(), backfill.started[1].unwrap());
+        let (wait_strict, wait_backfill) = (worst_small_wait(&s, &strict), worst_small_wait(&s, &backfill));
+        eprintln!("{}: strict: large job at {head_strict:.0}s, small jobs wait up to {wait_strict:.0}s", s.name);
+        eprintln!("{}: backfill: large job at {head_backfill:.0}s, small jobs wait up to {wait_backfill:.0}s", s.name);
+        assert!(strict.all_ran && backfill.all_ran);
+        assert!(wait_strict > 300.0, "the reservation holds small jobs back for minutes: {wait_strict:.0}s");
+        assert!(wait_backfill < 5.0, "small jobs start as they arrive: {wait_backfill:.0}s");
+        assert!(head_backfill <= head_strict + 1.0, "the large job starts no later: {head_backfill:.0}s vs {head_strict:.0}s");
+    }
+
+    #[test]
+    fn max_backfill_bounds_the_wait_of_a_job_small_jobs_keep_out() {
+        let s = steady_stream();
+        let head = |lim: &Limits| {
+            let o = run(&s, lim);
+            assert!(o.all_ran && o.started_under_pressure == 0, "{}", s.name);
+            o.started[30].unwrap() - 60.0
+        };
+        let strict = head(&LIM);
+        let unbounded = head(&Limits { max_backfill: f64::MAX, ..LIM });
+        let bounded = head(&Limits { max_backfill: 600.0, ..LIM });
+        eprintln!("{}: the 12 GB job waits {strict:.0}s strict, {unbounded:.0}s unbounded, {bounded:.0}s with max_backfill 600", s.name);
+        // Without a bound the large job starts only when the stream ends.
+        assert!(unbounded > 1400.0, "{unbounded:.0}s");
+        // With one, newer jobs stop at 600 s and it starts once they drain.
+        assert!((600.0..600.0 + 90.0).contains(&bounded), "{bounded:.0}s");
+        assert!(strict < 120.0 + 90.0, "{strict:.0}s");
     }
 }

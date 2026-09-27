@@ -289,6 +289,10 @@ pub struct Limits {
     pub mem_max_pct: f64,
     pub learn_stagger: f64,
     pub max_bypass: f64,
+    /// Until an older job has waited this long, its reservation holds only
+    /// while it could start; newer jobs that fit may start while it cannot.
+    /// At or below `max_bypass` (0 by default) a reservation always holds.
+    pub max_backfill: f64,
     /// Jobs that usually end sooner than this skip the CPU check.
     pub cpu_min_duration: f64,
     /// Memory pressure (0-100) at which nothing new starts.
@@ -415,81 +419,125 @@ pub fn decide(
         };
     }
 
-    let (res_cpu, res_mem) = reserve(running);
-    let cpu_limit = m.ncpu as f64 * lim.cpu_max_pct / 100.0;
-    let mem_limit = m.mem_total_kb as f64 * lim.mem_max_pct / 100.0;
-    let mem_used = m.mem_for_admission(running.iter().map(|e| e.live_mem_kb).sum());
+    let room = Room::new(m, lim, running);
 
     let mut blockers = Vec::new();
-
-    if let Some(r) = older.iter().find(|w| w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass) {
+    // An older job that newer ones have passed for `max_bypass` goes first.
+    // Within `max_backfill` it holds its turn only while it could start
+    // itself: a job that waits for memory cannot use the room it would hold,
+    // so newer jobs that fit may start meanwhile. Past `max_backfill` it holds
+    // its turn anyway, so a stream of small jobs cannot keep it out forever.
+    if let Some(r) = older.iter().find(|w| {
+        let waited = now - w.queued_at;
+        w.bypassed_since.is_some()
+            && waited > lim.max_bypass
+            && (waited > lim.max_backfill || room.blockers(m, lim, running, w, now, unknown_starts).is_empty())
+    }) {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
     }
-    if let (Some(pk), Some(max)) = (&me.pool_key, me.pool_slots) {
-        let holders: Vec<String> = running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).map(|e| e.key.clone()).collect();
-        if holders.len() as u32 >= max {
-            blockers.push(Blocker::Slots { pool: me.pool.clone().unwrap_or_default(), busy: holders.len() as u32, max, holders });
-        }
-    }
-    // Jobs with no history start in small batches, and a batch only starts
-    // once the jobs of the one before have run for `learn_stagger` seconds.
-    // Their needs are estimates until then, and the readings need time to show
-    // what the new jobs really take. A batch is as large as the free room
-    // allows: one job per free core, and as many as fit in the free memory at
-    // this job's estimated need.
-    if me.guessed()
-        && let Some((r, wait_s)) = running.iter().filter_map(|r| r.settling_for(now).map(|w| (r, w))).min_by(|a, b| a.1.total_cmp(&b.1))
-    {
-        blockers.push(Blocker::Settling { key: r.key.clone(), wait_s });
-    }
-    if !me.known && !me.raised_by_min {
-        let recent: Vec<f64> = unknown_starts.iter().copied().filter(|t| now - t < lim.learn_stagger).collect();
-        let free_cpu = cpu_limit - m.cpu_busy - res_cpu;
-        let free_mem_kb = mem_limit - (mem_used + res_mem) as f64;
-        let per_job_kb = me.need_mem_kb.max(512 * 1024) as f64;
-        let batch = free_cpu.min(free_mem_kb / per_job_kb).floor().max(1.0) as usize;
-        if !recent.is_empty() && recent.len() >= batch {
-            let newest = recent.iter().copied().fold(f64::MIN, f64::max);
-            blockers.push(Blocker::LearnStagger { wait_s: (lim.learn_stagger - (now - newest)).max(0.0) });
-        }
-    }
-    let mem_would = (mem_used + res_mem + me.need_mem_kb) as f64;
-    if mem_would > mem_limit {
-        blockers.push(Blocker::Memory {
-            would_pct: pct(mem_would, m.mem_total_kb as f64),
-            limit_pct: lim.mem_max_pct,
-            short_kb: (mem_would - mem_limit) as u64,
-            used_kb: mem_used,
-            reserve_kb: res_mem,
-            need_kb: me.need_mem_kb,
-            total_kb: m.mem_total_kb,
-        });
-    }
-    // A job that usually ends within a few seconds is over before the CPU
-    // reading could react to it, so holding it back only makes it late. Too
-    // little CPU only slows a job down; memory stays a hard rule for all.
-    let short = me.est_dur_s.is_some_and(|d| d < lim.cpu_min_duration);
-    let cpu_would = m.cpu_busy + res_cpu + me.need_cpu;
-    if !short && cpu_would > cpu_limit + 1e-9 {
-        blockers.push(Blocker::Cpu {
-            would: cpu_would,
-            limit: cpu_limit,
-            short: cpu_would - cpu_limit,
-            busy: m.cpu_busy,
-            reserve: res_cpu,
-            need: me.need_cpu,
-        });
-    }
+    blockers.extend(room.blockers(m, lim, running, me, now, unknown_starts));
     if blockers.is_empty() {
-        let cpu = if short {
+        let cpu = if short(lim, me) {
             format!("CPU not checked for a job that usually takes {:.1}s", me.est_dur_s.unwrap_or(0.0))
         } else {
-            format!("CPU {:.1}+{:.1}+{:.1} of {:.1} cores", m.cpu_busy, res_cpu, me.need_cpu, cpu_limit)
+            format!("CPU {:.1}+{:.1}+{:.1} of {:.1} cores", m.cpu_busy, room.res_cpu, me.need_cpu, room.cpu_limit)
         };
+        let mem_would = room.mem_would(me);
         Decision::Admit { reason: format!("fits: {cpu}, memory {:.0}% of {:.0}%", pct(mem_would, m.mem_total_kb as f64), lim.mem_max_pct) }
     } else {
         Decision::Wait { blockers }
     }
+}
+
+/// The room the running jobs leave, read once per decision.
+struct Room {
+    res_cpu: f64,
+    res_mem: u64,
+    cpu_limit: f64,
+    mem_limit: f64,
+    mem_used: u64,
+}
+
+impl Room {
+    fn new(m: &MachineSample, lim: &Limits, running: &[Entry]) -> Room {
+        let (res_cpu, res_mem) = reserve(running);
+        Room {
+            res_cpu,
+            res_mem,
+            cpu_limit: m.ncpu as f64 * lim.cpu_max_pct / 100.0,
+            mem_limit: m.mem_total_kb as f64 * lim.mem_max_pct / 100.0,
+            mem_used: m.mem_for_admission(running.iter().map(|e| e.live_mem_kb).sum()),
+        }
+    }
+
+    fn mem_would(&self, job: &Entry) -> f64 {
+        (self.mem_used + self.res_mem + job.need_mem_kb) as f64
+    }
+
+    /// What keeps `job` itself from starting now, apart from the jobs ahead
+    /// of it in line.
+    fn blockers(&self, m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry, now: f64, unknown_starts: &[f64]) -> Vec<Blocker> {
+        let mut blockers = Vec::new();
+        if let (Some(pk), Some(max)) = (&job.pool_key, job.pool_slots) {
+            let holders: Vec<String> = running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).map(|e| e.key.clone()).collect();
+            if holders.len() as u32 >= max {
+                blockers.push(Blocker::Slots { pool: job.pool.clone().unwrap_or_default(), busy: holders.len() as u32, max, holders });
+            }
+        }
+        // Jobs with no history start in small batches, and a batch only starts
+        // once the jobs of the one before have run for `learn_stagger` seconds.
+        // Their needs are estimates until then, and the readings need time to show
+        // what the new jobs really take. A batch is as large as the free room
+        // allows: one job per free core, and as many as fit in the free memory at
+        // this job's estimated need.
+        if job.guessed()
+            && let Some((r, wait_s)) = running.iter().filter_map(|r| r.settling_for(now).map(|w| (r, w))).min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            blockers.push(Blocker::Settling { key: r.key.clone(), wait_s });
+        }
+        if !job.known && !job.raised_by_min {
+            let recent: Vec<f64> = unknown_starts.iter().copied().filter(|t| now - t < lim.learn_stagger).collect();
+            let free_cpu = self.cpu_limit - m.cpu_busy - self.res_cpu;
+            let free_mem_kb = self.mem_limit - (self.mem_used + self.res_mem) as f64;
+            let per_job_kb = job.need_mem_kb.max(512 * 1024) as f64;
+            let batch = free_cpu.min(free_mem_kb / per_job_kb).floor().max(1.0) as usize;
+            if !recent.is_empty() && recent.len() >= batch {
+                let newest = recent.iter().copied().fold(f64::MIN, f64::max);
+                blockers.push(Blocker::LearnStagger { wait_s: (lim.learn_stagger - (now - newest)).max(0.0) });
+            }
+        }
+        let mem_would = self.mem_would(job);
+        if mem_would > self.mem_limit {
+            blockers.push(Blocker::Memory {
+                would_pct: pct(mem_would, m.mem_total_kb as f64),
+                limit_pct: lim.mem_max_pct,
+                short_kb: (mem_would - self.mem_limit) as u64,
+                used_kb: self.mem_used,
+                reserve_kb: self.res_mem,
+                need_kb: job.need_mem_kb,
+                total_kb: m.mem_total_kb,
+            });
+        }
+        let cpu_would = m.cpu_busy + self.res_cpu + job.need_cpu;
+        if !short(lim, job) && cpu_would > self.cpu_limit + 1e-9 {
+            blockers.push(Blocker::Cpu {
+                would: cpu_would,
+                limit: self.cpu_limit,
+                short: cpu_would - self.cpu_limit,
+                busy: m.cpu_busy,
+                reserve: self.res_cpu,
+                need: job.need_cpu,
+            });
+        }
+        blockers
+    }
+}
+
+/// A job that usually ends within a few seconds is over before the CPU
+/// reading could react to it, so holding it back only makes it late. Too
+/// little CPU only slows a job down; memory stays a hard rule for all.
+fn short(lim: &Limits, job: &Entry) -> bool {
+    job.est_dur_s.is_some_and(|d| d < lim.cpu_min_duration)
 }
 
 fn pct(a: f64, b: f64) -> f64 {
@@ -501,8 +549,15 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1024 * 1024;
-    const LIM: Limits =
-        Limits { cpu_max_pct: 100.0, mem_max_pct: 85.0, learn_stagger: 2.0, max_bypass: 120.0, cpu_min_duration: 5.0, pressure_max: 20.0 };
+    const LIM: Limits = Limits {
+        cpu_max_pct: 100.0,
+        mem_max_pct: 85.0,
+        learn_stagger: 2.0,
+        max_bypass: 120.0,
+        max_backfill: 0.0,
+        cpu_min_duration: 5.0,
+        pressure_max: 20.0,
+    };
 
     /// A running entry exactly as v0.1.2 writes it.
     const ENTRY_V0_1_2: &str = r#"{"ticket":7,"pid":4242,"run_id":31,"key":"packages/api:tsc","ns":"shop","label":"typecheck","pool":null,"pool_key":null,"pool_slots":null,"checkout":"/w/shop","queued_at":1000.5,"started_at":1002.0,"need_cpu":3.0,"need_mem_kb":1468006,"known":true,"raised_by_min":false,"now":false,"live_cpu":1.2,"live_mem_kb":900000,"bypassed_since":null,"blocker":null,"blocker_since":null,"est_dur_s":20.0,"estimate_from":null}"#;
@@ -623,6 +678,89 @@ mod tests {
         assert!(blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &small, 1100.0, &[])).is_empty());
         // Past it: nobody newer may start.
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[running], &waiting, &small, 1200.0, &[])), vec!["reserved"]);
+    }
+
+    /// A 20 GB compile has run since 1000 and holds its memory. At 1000 a
+    /// 12 GB job arrived that does not fit next to it, and newer jobs have
+    /// passed it since 1010.
+    fn blocked_head() -> (Entry, Entry) {
+        let mut running = job(1, "compile", 1.0, 20);
+        running.started_at = Some(1000.0);
+        running.live_mem_kb = 20 * GB;
+        let mut head = job(2, "typecheck", 2.0, 12);
+        head.bypassed_since = Some(1010.0);
+        (running, head)
+    }
+
+    #[test]
+    fn a_reserved_job_that_does_not_fit_lets_newer_jobs_that_fit_start() {
+        let (running, head) = blocked_head();
+        let small = job(3, "install", 0.2, 1);
+        let waiting = [head.clone(), small.clone()];
+        let backfill = Limits { max_backfill: 1800.0, ..LIM };
+        // 20 GB held + 12 GB needed is more than 27.2 GB (85% of 32).
+        let m = machine(2.0, 21);
+        let r = std::slice::from_ref(&running);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &head, 1300.0, &[])), vec!["memory"]);
+        // The small job fits and starts: the head could not use the room.
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &small, 1300.0, &[])).is_empty());
+        // Without backfill, the head keeps its reservation, as before.
+        assert_eq!(blockers(decide(&m, &LIM, r, &waiting, &small, 1300.0, &[])), vec!["reserved"]);
+
+        // The compile shrinks to 5 GB: now the head fits, so it goes first.
+        let mut shrunk = running.clone();
+        shrunk.need_mem_kb = 5 * GB;
+        shrunk.live_mem_kb = 5 * GB;
+        let m = machine(2.0, 6);
+        let r = std::slice::from_ref(&shrunk);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &small, 1300.0, &[])), vec!["reserved"]);
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &head, 1300.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn past_max_backfill_the_reservation_holds_even_when_the_job_does_not_fit() {
+        let (running, head) = blocked_head();
+        let small = job(3, "install", 0.2, 1);
+        let waiting = [head.clone(), small.clone()];
+        let backfill = Limits { max_backfill: 1800.0, ..LIM };
+        let m = machine(2.0, 21);
+        let r = std::slice::from_ref(&running);
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &small, 2799.0, &[])).is_empty());
+        // Waiting longer than 1800 s: newer jobs stop, so memory drains until
+        // the head fits.
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &small, 2801.0, &[])), vec!["reserved"]);
+        // A window no longer than max_bypass is no window: the old rule.
+        let none = Limits { max_backfill: 120.0, ..LIM };
+        assert_eq!(blockers(decide(&m, &none, r, &waiting, &small, 1300.0, &[])), vec!["reserved"]);
+    }
+
+    #[test]
+    fn backfill_keeps_pools_and_pressure() {
+        let (mut running, mut head) = blocked_head();
+        let backfill = Limits { max_backfill: 1800.0, ..LIM };
+        // The head is held only by its pool slot: newer jobs outside the pool
+        // start, newer jobs in the same pool still wait for the slot.
+        running.need_mem_kb = GB;
+        running.live_mem_kb = GB;
+        running.pool_key = Some("db@/repo".into());
+        head.pool = Some("db".into());
+        head.pool_key = Some("db@/repo".into());
+        head.pool_slots = Some(1);
+        let mut same_pool = job(3, "migrate", 0.2, 1);
+        same_pool.pool = head.pool.clone();
+        same_pool.pool_key = head.pool_key.clone();
+        same_pool.pool_slots = Some(1);
+        let other = job(4, "lint", 0.2, 1);
+        let waiting = [head.clone(), same_pool.clone(), other.clone()];
+        let m = machine(2.0, 2);
+        let r = std::slice::from_ref(&running);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &head, 1300.0, &[])), vec!["slots"]);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &same_pool, 1300.0, &[])), vec!["slots"]);
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &other, 1300.0, &[])).is_empty());
+        // Memory pressure still stops every new job.
+        let mut m = m;
+        m.mem_pressure = Some(50.0);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &other, 1300.0, &[])), vec!["pressure"]);
     }
 
     #[test]

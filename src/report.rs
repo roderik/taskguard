@@ -509,6 +509,7 @@ mod tests {
             mem_max_pct: 85.0,
             learn_stagger: 0.0,
             max_bypass: 120.0,
+            max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
         };
@@ -530,6 +531,7 @@ mod tests {
             mem_max_pct: 85.0,
             learn_stagger: 2.0,
             max_bypass: 120.0,
+            max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
         };

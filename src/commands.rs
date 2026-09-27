@@ -18,6 +18,7 @@ pub fn limits(cfg: &Config) -> Limits {
         mem_max_pct: cfg.mem_max,
         learn_stagger: cfg.learn_stagger,
         max_bypass: cfg.max_bypass as f64,
+        max_backfill: cfg.max_backfill as f64,
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
     }
@@ -112,8 +113,8 @@ pub fn doctor(args: &[String]) -> Result<i32> {
     println!("namespace here: {}", key::namespace(&cwd));
     println!();
     println!(
-        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  hints {}",
-        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.hints
+        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  hints {}",
+        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.hints
     );
     for (k, v) in &cfg.origin {
         if v != "built-in" {

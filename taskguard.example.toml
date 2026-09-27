@@ -40,6 +40,9 @@ learn_stagger = 5     # a batch of jobs with no history starts after the last on
 new_job_mem = "1.5G"  # memory a job with no history reserves when no similar job is known
 cpu_min_duration = 5  # jobs that usually end sooner than this skip the CPU check
 max_bypass = 120      # seconds a job may be passed by newer ones before it is reserved
+max_backfill = 0      # until a reserved job has waited this many seconds, newer jobs that fit
+                      # may start while it cannot; 0 (or anything up to max_bypass) = never.
+                      # taskguard 0.1.6 and older reject a file that sets it.
 boost_runs = 5        # runs that get +25% memory after a memory-starved run
 
 # ---------------------------------------------------------------- timing ----

@@ -301,6 +301,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         mem_max_pct: cfg.mem_max,
         learn_stagger: cfg.learn_stagger,
         max_bypass: cfg.max_bypass as f64,
+        max_backfill: cfg.max_backfill as f64,
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
     };
